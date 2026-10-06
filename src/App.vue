@@ -7,12 +7,12 @@
  * it under the terms of the GNU Affero General Public License as published by
  * the Free Software Foundation, either version 3 of the License, or
  * (at your option) any later version.
-
+ *
  * This program is distributed in the hope that it will be useful,
  * but WITHOUT ANY WARRANTY; without even the implied warranty of
  * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
  * GNU Affero General Public License for more details.
-
+ *
  * You should have received a copy of the GNU Affero General Public License
  * along with this program.  If not, see <https://www.gnu.org/licenses/>.
  *
@@ -21,8 +21,13 @@
 
 <script setup lang="ts">
 import { ref, watch, computed, onMounted, onUnmounted } from 'vue'
+import * as pdfjsLib from 'pdfjs-dist'
+import workerUrl from 'pdfjs-dist/build/pdf.worker.min.mjs?url'
+
+pdfjsLib.GlobalWorkerOptions.workerSrc = workerUrl
 
 import type { FieldInfoData, TicketData, TicketStyleConfig, TicketConfig } from '@/types'
+import { parse12306InvoiceText } from '@/utils/invoiceParser'
 
 import DynamicForm from '@/components/common/DynamicForm.vue'
 import InfoHead from '@/components/common/InfoHead.vue'
@@ -37,7 +42,6 @@ import type { BadgeOption } from '@/components/common/BadgeGroup.vue'
 
 import { receiptConfig } from '@/configs/receipt'
 
-// 票据配置映射
 const ticketConfigMap: Record<string, TicketConfig> = {
   receipt: receiptConfig,
 }
@@ -64,7 +68,6 @@ const selectedTicketType = ref('')
 const activeKey = computed(() => ticketTypeKeyMap[selectedTicketType.value] || '')
 const currentConfig = computed<TicketConfig | null>(() => ticketConfigMap[activeKey.value] || null)
 
-// 样式配置
 const styleConfig = ref<TicketStyleConfig | null>(null)
 const defaultStyleConfig = computed(() => currentConfig.value?.defaultStyleConfig ?? null)
 const styleFieldGroups = computed(() => currentConfig.value?.styleFieldGroups ?? [])
@@ -93,7 +96,6 @@ watch(activeKey, () => {
   }
 })
 
-// 响应式布局
 const isSideLayout = ref(false)
 const checkLayout = () => {
   const w = window.innerWidth
@@ -103,12 +105,77 @@ const checkLayout = () => {
 onMounted(() => {
   checkLayout()
   window.addEventListener('resize', checkLayout)
+
+  const params = new URLSearchParams(window.location.search)
+  const auto = params.get('auto')
+  if (auto) {
+    try {
+      const b64 = auto.replace(/-/g, '+').replace(/_/g, '/')
+      const json = decodeURIComponent(escape(atob(b64)))
+      const data = JSON.parse(json)
+      selectedTicketType.value = '蓝票(报销凭证)'
+      setTimeout(() => {
+        Object.assign(ticketInfo.value, data)
+      }, 50)
+    } catch (e) {
+      console.error('auto parse failed', e)
+    }
+  }
 })
 onUnmounted(() => {
   window.removeEventListener('resize', checkLayout)
 })
 
-// Badge 选择组选项
+// ===== 上传 12306 PDF 自动解析 =====
+const invoiceInput = ref<HTMLInputElement | null>(null)
+const parseStatus = ref('')
+const parseWarnings = ref<string[]>([])
+const parsing = ref(false)
+
+async function handleInvoiceFile(file: File) {
+  parsing.value = true
+  parseStatus.value = `正在解析 ${file.name} ...`
+  parseWarnings.value = []
+  try {
+    const buf = await file.arrayBuffer()
+    const task = pdfjsLib.getDocument({
+      data: buf,
+      verbosity: 0,
+      cMapUrl: 'https://cdn.jsdelivr.net/npm/pdfjs-dist@6.4.299/cmaps/',
+      cMapPacked: true,
+    })
+    const pdf = await task.promise
+    let all = ''
+    for (let i = 1; i <= pdf.numPages; i++) {
+      const page = await pdf.getPage(i)
+      const tc = await page.getTextContent()
+      all += tc.items.map((it: any) => it.str).join('\n') + '\n'
+    }
+    const result = parse12306InvoiceText(all)
+    if (result.ticket) {
+      selectedTicketType.value = '蓝票(报销凭证)'
+      setTimeout(() => {
+        Object.assign(ticketInfo.value, result.ticket)
+        parseWarnings.value = result.warnings
+        parseStatus.value = `已解析 ${file.name}（${result.warnings.length ? result.warnings.length + ' 个警告' : '字段完整'}）`
+      }, 50)
+    } else {
+      parseStatus.value = '解析失败：未识别到车票字段'
+    }
+  } catch (e: any) {
+    parseStatus.value = `解析出错：${e?.message ?? e}`
+  } finally {
+    parsing.value = false
+  }
+}
+
+function onInvoiceChange(e: Event) {
+  const input = e.target as HTMLInputElement
+  const f = input.files?.[0]
+  if (f) handleInvoiceFile(f)
+  input.value = ''
+}
+
 const identityOptions: BadgeOption[] = [
   { label: '成人', value: 'adult' },
   { label: '学生', value: 'student' },
@@ -194,7 +261,6 @@ const ticketInfo = ref<TicketData>({
   payMethod: '',
 })
 
-// 身份联动：学生 → 自动勾选优惠且锁定
 watch(
   () => ticketInfo.value.identity,
   (val) => {
@@ -204,11 +270,9 @@ watch(
   },
 )
 
-// 优惠 badge（多选数组）→ 同步到 isDiscount 布尔值
 const discountSelection = computed<string[]>({
   get: () => (ticketInfo.value.isDiscount ? ['discount'] : []),
   set: (val: string[]) => {
-    // 学生身份下不允许取消优惠
     if (ticketInfo.value.identity === 'student') {
       ticketInfo.value.isDiscount = true
       return
@@ -222,10 +286,25 @@ const discountSelection = computed<string[]>({
   <div class="app-root">
     <div class="app-card">
       <InfoHead />
+
+      <div class="upload-panel">
+        <label class="upload-btn" :class="{ disabled: parsing }">
+          <input
+            ref="invoiceInput"
+            type="file"
+            accept="application/pdf,.pdf"
+            @change="onInvoiceChange"
+            hidden
+          />
+          <span>{{ parsing ? '解析中…' : '📄 上传 12306 电子发票 PDF' }}</span>
+        </label>
+        <p v-if="parseStatus" class="parse-status" :class="{ warn: parseWarnings.length }">{{ parseStatus }}</p>
+        <p v-for="(w, i) in parseWarnings" :key="i" class="parse-warn">⚠ {{ w }}</p>
+      </div>
+
       <PromotionBar />
 
       <div class="app-layout" :class="{ 'side-layout': isSideLayout }">
-        <!-- 表单区 -->
         <div class="form-panel">
           <DynamicForm
             class="mb-4"
@@ -234,7 +313,6 @@ const discountSelection = computed<string[]>({
             :compact="isSideLayout"
           />
 
-          <!-- Badge 选择组 -->
           <div class="badge-section">
             <BadgeGroup
               label="身份"
@@ -259,7 +337,6 @@ const discountSelection = computed<string[]>({
             />
           </div>
 
-          <!-- 票据类型 -->
           <div class="mb-4">
             <label class="block text-sm font-medium text-gray-600 dark:text-gray-400 mb-1.5">
               票据类型
@@ -271,7 +348,6 @@ const discountSelection = computed<string[]>({
             />
           </div>
 
-          <!-- 样式配置 -->
           <StyleConfigForm
             v-if="styleConfig && defaultStyleConfig"
             v-model="styleConfig"
@@ -282,7 +358,6 @@ const discountSelection = computed<string[]>({
           />
         </div>
 
-        <!-- 预览区 -->
         <div class="preview-panel">
           <div class="preview-inner">
             <TicketPreview
@@ -375,6 +450,27 @@ html.dark .app-card {
   border: 1px solid rgba(0, 0, 0, 0.04);
 }
 
+.upload-panel {
+  @apply mb-4 p-4 rounded-xl;
+  background: rgba(0, 122, 255, 0.05);
+  border: 1px dashed rgba(0, 122, 255, 0.3);
+}
+.upload-btn {
+  @apply inline-flex items-center px-4 py-2 rounded-lg cursor-pointer text-sm font-medium;
+  background: #007aff;
+  color: #fff;
+  transition: transform 0.1s;
+}
+.upload-btn:hover { transform: translateY(-1px); }
+.upload-btn.disabled { opacity: 0.6; cursor: wait; }
+.parse-status {
+  @apply mt-2 text-xs text-gray-600 dark:text-gray-300;
+}
+.parse-status.warn { color: #b45309; }
+.parse-warn {
+  @apply mt-1 text-xs text-amber-600 dark:text-amber-400;
+}
+
 html.dark .badge-section {
   background: rgba(255, 255, 255, 0.03);
   border-color: rgba(255, 255, 255, 0.06);
@@ -386,6 +482,6 @@ html.dark .badge-section {
 }
 
 html.dark .empty-state {
-  border-color: rgba(255, 255, 255, 0.08);
+  border-color: rgba(0, 0, 0, 0.08);
 }
 </style>
